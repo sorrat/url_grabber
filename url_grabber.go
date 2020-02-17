@@ -19,6 +19,8 @@ type Result struct {
 	Error error
 }
 
+type Worker func(<-chan string, *sync.WaitGroup)
+
 func downloadPage(url string) (string, error) {
 	httpClient := http.Client{
 		Timeout: 20 * time.Second,
@@ -55,32 +57,27 @@ func downloadAndCount(url string, pattern *regexp.Regexp) (int, error) {
 	return count, nil
 }
 
-func downloadAndCountWorker(
-	urls <-chan string,
-	pattern *regexp.Regexp,
-	results chan<- *Result,
-	wg *sync.WaitGroup,
-) {
-	defer wg.Done()
-	for url := range urls {
-		count, err := downloadAndCount(url, pattern)
-		results <- &Result{url, count, err}
+func downloadAndCountWorker(pattern *regexp.Regexp, results chan<- *Result) Worker {
+	return func(
+		input <-chan string,
+		wg *sync.WaitGroup,
+	) {
+		defer wg.Done()
+		for url := range input {
+			count, err := downloadAndCount(url, pattern)
+			results <- &Result{url, count, err}
+		}
 	}
 }
 
-func enqueueTasksFrom(
+func enqueueTasks(
 	stream io.Reader,
-	pattern *regexp.Regexp,
-	workersLimit int,
-	results chan<- *Result,
+	q chan<- string,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
+	defer close(q)
 
-	urls := make(chan string, workersLimit)
-	defer close(urls)
-
-	workersNum := workersLimit
 	scanner := bufio.NewScanner(stream)
 	for {
 		scanner.Scan()
@@ -88,16 +85,34 @@ func enqueueTasksFrom(
 		if len(text) == 0 {
 			break
 		}
-		if workersNum > 0 {
-			wg.Add(1)
-			go downloadAndCountWorker(urls, pattern, results, wg)
-			workersNum--
-		}
-		urls <- text
+		q <- text
 	}
 }
 
-func processResults(
+func processTasks(
+	input <-chan string,
+	workersLimit int,
+	startWorker Worker,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	workersLeft := workersLimit
+	inputBuffer := make(chan string, workersLimit)
+	defer close(inputBuffer)
+
+	for item := range input {
+		inputBuffer <- item
+
+		if workersLeft > 0 {
+			wg.Add(1)
+			go startWorker(inputBuffer, wg)
+			workersLeft--
+		}
+	}
+}
+
+func processResultCounts(
 	results <-chan *Result,
 	wg *sync.WaitGroup,
 ) {
@@ -115,17 +130,21 @@ func processResults(
 }
 
 func main() {
-	const workersLimit = 5
 	pattern := regexp.MustCompile(`\bGo\b`)
 	results := make(chan *Result)
+	startWorker := downloadAndCountWorker(pattern, results)
+
+	workersLimit := 5
+	input := make(chan string)
 
 	wg1 := new(sync.WaitGroup)
-	wg1.Add(1)
-	go enqueueTasksFrom(os.Stdin, pattern, workersLimit, results, wg1)
+	wg1.Add(2)
+	go enqueueTasks(os.Stdin, input, wg1)
+	go processTasks(input, workersLimit, startWorker, wg1)
 
 	wg2 := new(sync.WaitGroup)
 	wg2.Add(1)
-	go processResults(results, wg2)
+	go processResultCounts(results, wg2)
 
 	wg1.Wait()
 	close(results)
