@@ -13,13 +13,15 @@ import (
 	"time"
 )
 
+type Task string
 type Result struct {
 	URL   string
 	Count int
 	Error error
 }
+type TaskManager func(Task)
+type Worker func(<-chan Task, *sync.WaitGroup)
 
-type Worker func(<-chan string, *sync.WaitGroup)
 
 func downloadPage(url string) (string, error) {
 	httpClient := http.Client{
@@ -57,26 +59,52 @@ func downloadAndCount(url string, pattern *regexp.Regexp) (int, error) {
 	return count, nil
 }
 
-func downloadAndCountWorker(pattern *regexp.Regexp, results chan<- *Result) Worker {
+func downloadAndCountWorker(
+	pattern *regexp.Regexp,
+	results chan<- *Result,
+) Worker {
 	return func(
-		input <-chan string,
+		input <-chan Task,
 		wg *sync.WaitGroup,
 	) {
 		defer wg.Done()
-		for url := range input {
+		for task := range input {
+			url := string(task)
 			count, err := downloadAndCount(url, pattern)
 			results <- &Result{url, count, err}
 		}
 	}
 }
 
-func enqueueTasks(
+func concurrentTaskManager(
+	workersLimit int,
+	startWorker Worker,
+	wg *sync.WaitGroup,
+) TaskManager {
+	input := make(chan Task, workersLimit)
+	workersLeft := workersLimit
+
+	return func(x Task) {
+		if len(x) == 0 {
+			close(input)
+			return
+		}
+		input <- x
+		if workersLeft > 0 {
+			workersLeft--
+			wg.Add(1)
+			go startWorker(input, wg)
+		}
+	}
+}
+
+func handleTasksFrom(
 	stream io.Reader,
-	q chan<- string,
+	handleTask TaskManager,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
-	defer close(q)
+	defer handleTask("")
 
 	scanner := bufio.NewScanner(stream)
 	for {
@@ -85,34 +113,11 @@ func enqueueTasks(
 		if len(text) == 0 {
 			break
 		}
-		q <- text
+		handleTask(Task(text))
 	}
 }
 
-func processTasks(
-	input <-chan string,
-	workersLimit int,
-	startWorker Worker,
-	wg *sync.WaitGroup,
-) {
-	defer wg.Done()
-
-	workersLeft := workersLimit
-	inputBuffer := make(chan string, workersLimit)
-	defer close(inputBuffer)
-
-	for item := range input {
-		inputBuffer <- item
-
-		if workersLeft > 0 {
-			wg.Add(1)
-			go startWorker(inputBuffer, wg)
-			workersLeft--
-		}
-	}
-}
-
-func processResultCounts(
+func logResultCounts(
 	results <-chan *Result,
 	wg *sync.WaitGroup,
 ) {
@@ -134,17 +139,16 @@ func main() {
 	results := make(chan *Result)
 	startWorker := downloadAndCountWorker(pattern, results)
 
-	workersLimit := 5
-	input := make(chan string)
-
 	wg1 := new(sync.WaitGroup)
-	wg1.Add(2)
-	go enqueueTasks(os.Stdin, input, wg1)
-	go processTasks(input, workersLimit, startWorker, wg1)
+	workersLimit := 5
+	handleTask := concurrentTaskManager(workersLimit, startWorker, wg1)
+
+	wg1.Add(1)
+	go handleTasksFrom(os.Stdin, handleTask, wg1)
 
 	wg2 := new(sync.WaitGroup)
 	wg2.Add(1)
-	go processResultCounts(results, wg2)
+	go logResultCounts(results, wg2)
 
 	wg1.Wait()
 	close(results)
